@@ -647,20 +647,65 @@ input[type="file"]::file-selector-button:hover {
         const APP_STORAGE_KEY = 'absenguru_app_data_v5';
         try { localStorage.removeItem('absenguru_app_mode'); } catch(e){}
 
-        // SAFE STORAGE & DB ADAPTER (Mencegah Firestore menimpa data lengkap)
+        // SAFE STORAGE & DB ADAPTER (Mendukung semua pemanggilan Firestore: get, doc, where, limit, orderBy, batch, add, onSnapshot)
+        const createMockSnapshot = (items = []) => ({
+            empty: items.length === 0,
+            size: items.length,
+            docs: items.map(it => ({
+                id: it.id || 'doc_' + Math.random().toString(36).substring(2, 9),
+                data: () => it,
+                exists: true,
+                ref: {
+                    delete: async () => Promise.resolve(),
+                    set: async () => Promise.resolve(),
+                    update: async () => Promise.resolve()
+                }
+            })),
+            forEach: function(cb) { this.docs.forEach(cb); }
+        });
+
+        const createMockQuery = (colName) => {
+            const query = {
+                where: () => query,
+                limit: () => query,
+                orderBy: () => query,
+                get: async () => Promise.resolve(createMockSnapshot([])),
+                onSnapshot: (cb) => { return () => {}; }
+            };
+            return query;
+        };
+
         const createMockCollection = (colName) => ({
             doc: (docId) => ({
+                id: docId,
                 set: async (data, opts) => Promise.resolve(),
                 update: async (data) => Promise.resolve(),
                 delete: async () => Promise.resolve(),
-                get: async () => Promise.resolve({ exists: false, data: () => ({}) })
+                get: async () => Promise.resolve({
+                    id: docId,
+                    exists: false,
+                    data: () => ({})
+                }),
+                onSnapshot: (callback) => { return () => {}; }
             }),
             add: async (data) => Promise.resolve({ id: 'doc_' + Date.now() }),
+            get: async () => Promise.resolve(createMockSnapshot([])),
+            where: () => createMockQuery(colName),
+            limit: () => createMockQuery(colName),
+            orderBy: () => createMockQuery(colName),
             onSnapshot: (callback) => { return () => {}; }
         });
+
         let db = {
-            collection: (colName) => createMockCollection(colName)
+            collection: (colName) => createMockCollection(colName),
+            batch: () => ({
+                set: () => {},
+                update: () => {},
+                delete: () => {},
+                commit: async () => Promise.resolve()
+            })
         };
+        window.db = db;
 
         const PREVIEW_MOCK_DATA = {
         "riwayat": [
@@ -6709,6 +6754,7 @@ var app = {
                     this.showToast('Akses ditolak: Anda bukan Admin', 'error', 'text-red-400');
                 }
                 
+                try {
                 if (screenId === 'guru-dashboard') {
                     this.loadDashboardGuruData(user);
                 } else if (screenId === 'guru-riwayat') {
@@ -6740,6 +6786,9 @@ var app = {
                     this.renderPengaturan();
                 }
 
+                } catch(errScreen) {
+                    console.error("Error saat memuat data layar " + screenId + ":", errScreen);
+                }
                 if (screenId !== 'guru-presensi' && this.matikanKamera) {
                     this.matikanKamera();
                 }
@@ -11513,43 +11562,47 @@ var app = {
         if (!this.mockData) this.mockData = {};
         if (!Array.isArray(this.mockData.dataGuru)) this.mockData.dataGuru = [];
 
-        // Jika data guru sudah ada di memori/lokal, langsung render seketika tanpa jeda kosong
-        if (this.mockData.dataGuru.length > 0) {
-            this.renderDataGuru();
-        } else {
-            tbody.innerHTML = '<tr><td colspan="9" class="text-center p-4 text-gray-500">Memuat data...</td></tr>';
-        }
+        // Langsung render data guru dari memori / lokal
+        this.renderDataGuru();
 
-        // Ambil data terbaru dari Firebase koleksi data_guru jika tersedia
-        if (typeof db !== 'undefined') {
-            db.collection('data_guru').get().then(snapshot => {
-                if (snapshot && !snapshot.empty) {
-                    let koleksiGuru = [];
-                    snapshot.forEach(doc => {
-                        const d = doc.data();
-                        if (d) koleksiGuru.push(d);
+        // Ambil data terbaru dari Firebase koleksi data_guru jika tersedia secara aman
+        try {
+            if (typeof db !== 'undefined' && db && typeof db.collection === 'function') {
+                const colRef = db.collection('data_guru');
+                if (colRef && typeof colRef.get === 'function') {
+                    colRef.get().then(snapshot => {
+                        if (snapshot && !snapshot.empty) {
+                            let koleksiGuru = [];
+                            snapshot.forEach(doc => {
+                                const d = doc.data();
+                                if (d) koleksiGuru.push(d);
+                            });
+                            let map = new Map();
+                            (this.mockData.dataGuru || []).forEach(g => {
+                                if (g && g.id) map.set(g.id, g);
+                            });
+                            koleksiGuru.forEach(g => {
+                                if (!g || !g.id) return;
+                                if (g.isDeleted) map.delete(g.id);
+                                else map.set(g.id, g);
+                            });
+                            this.mockData.dataGuru = Array.from(map.values()).sort((a,b) => {
+                                return (a.nama || '').localeCompare(b.nama || '');
+                            });
+                            try {
+                                localStorage.setItem(APP_STORAGE_KEY, JSON.stringify(this.mockData));
+                            } catch(e) {}
+                        }
+                        this.renderDataGuru();
+                    }).catch(e => {
+                        console.warn("Notice sync data_guru:", e);
+                        this.renderDataGuru();
                     });
-                    let map = new Map();
-                    (this.mockData.dataGuru || []).forEach(g => {
-                        if (g && g.id) map.set(g.id, g);
-                    });
-                    koleksiGuru.forEach(g => {
-                        if (!g || !g.id) return;
-                        if (g.isDeleted) map.delete(g.id);
-                        else map.set(g.id, g);
-                    });
-                    this.mockData.dataGuru = Array.from(map.values()).sort((a,b) => {
-                        return (a.nama || '').localeCompare(b.nama || '');
-                    });
-                    try {
-                        localStorage.setItem(APP_STORAGE_KEY, JSON.stringify(this.mockData));
-                    } catch(e) {}
                 }
-                this.renderDataGuru();
-            }).catch(e => {
-                console.warn("Gagal get data_guru:", e);
-                this.renderDataGuru();
-            });
+            }
+        } catch(e) {
+            console.warn("Exception get data_guru:", e);
+            this.renderDataGuru();
         }
     },
 
